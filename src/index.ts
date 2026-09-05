@@ -128,22 +128,19 @@ export default {
       }
     }
 
-    // --- API: POSTAR VÍDEO (Título recebido em Base64 e sem dependência de embed externo) ---
+    // --- API: POSTAR VÍDEO (Com título e arquivo de vídeo salvos em Base64 no StreamifyDB) ---
     if (path === '/api/videos' && method === 'POST') {
       try {
-        const { titleBase64, channelName } = await request.json() as any;
-        if (!titleBase64 || !channelName) {
-          return new Response(JSON.stringify({ error: 'Dados incompletos.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        const { titleBase64, videoDataUrl, channelName } = await request.json() as any;
+        if (!titleBase64 || !videoDataUrl || !channelName) {
+          return new Response(JSON.stringify({ error: 'Dados incompletos ou arquivo ausente.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
         if (/svg/i.test(titleBase64)) {
           return new Response(JSON.stringify({ error: 'Segurança: Conteúdo SVG proibido.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        // URL padrão ou placeholder nativo do Streamify para vídeos enviados diretamente
-        const nativeVideoUrl = "https://www.w3schools.com/html/mov_bbb.mp4";
-
-        await database.prepare('INSERT INTO videos (title, video_url, channel_name, likes, dislikes, views) VALUES (?, ?, ?, 0, 0, 0)').bind(titleBase64, nativeVideoUrl, channelName).run();
+        await database.prepare('INSERT INTO videos (title, video_url, channel_name, likes, dislikes, views) VALUES (?, ?, ?, 0, 0, 0)').bind(titleBase64, videoDataUrl, channelName).run();
         return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: 'Erro ao publicar vídeo no StreamifyDB.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
@@ -221,9 +218,11 @@ export default {
               .modal-content { background: #212121; padding: 30px; border-radius: 12px; width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 15px; border: 1px solid #303030; }
               .modal-content h2 { margin-bottom: 5px; font-size: 22px; }
               input { width: 100%; padding: 12px; background: #121212; border: 1px solid #303030; border-radius: 8px; color: #fff; font-size: 14px; }
+              input[type="file"] { padding: 8px; cursor: pointer; }
               input:focus { border-color: #3ea6ff; outline: none; }
               .hidden { display: none !important; }
               .flex-row { display: flex; gap: 10px; justify-content: flex-end; }
+              .upload-label { font-size: 13px; color: #aaa; margin-bottom: -10px; }
           </style>
       </head>
       <body>
@@ -275,6 +274,8 @@ export default {
               <div class="modal-content">
                   <h2>Postar Vídeo</h2>
                   <input type="text" id="vidTitle" placeholder="Título do Vídeo">
+                  <span class="upload-label">Selecionar Arquivo de Vídeo:</span>
+                  <input type="file" id="vidFile" accept="video/*">
                   <div class="flex-row">
                       <button class="btn-secondary" onclick="closeModal('uploadModal')">Cancelar</button>
                       <button onclick="uploadVideo()">Publicar</button>
@@ -363,32 +364,41 @@ export default {
                   updateUI();
               }
 
-              async function uploadVideo() {
+              function uploadVideo() {
                   const title = document.getElementById('vidTitle').value;
+                  const fileInput = document.getElementById('vidFile');
 
-                  if (!title) {
-                      alert('Preencha o título do vídeo.');
+                  if (!title || fileInput.files.length === 0) {
+                      alert('Insira o título e selecione um arquivo de vídeo.');
                       return;
                   }
 
-                  // Codifica o título em Base64 antes do envio
-                  const titleBase64 = btoa(unescape(encodeURIComponent(title)));
+                  const file = fileInput.files[0];
+                  const reader = new FileReader();
 
-                  const res = await fetch('/api/videos', {
-                      method: 'POST',
-                      headers: {'Content-Type': 'application/json'},
-                      body: JSON.stringify({ titleBase64, channelName: currentUser.channelName })
-                  });
+                  reader.onload = async function(uploadEvent) {
+                      const videoDataUrl = uploadEvent.target.result; // Arquivo convertido em Base64 Data URL
+                      const titleBase64 = btoa(unescape(encodeURIComponent(title))); // Título codificado em Base64
 
-                  const data = await res.json();
-                  if (res.ok) {
-                      closeModal('uploadModal');
-                      document.getElementById('vidTitle').value = '';
-                      ws.send(JSON.stringify({ type: 'new_video' }));
-                      loadVideos();
-                  } else {
-                      alert(data.error || 'Erro ao publicar vídeo.');
-                  }
+                      const res = await fetch('/api/videos', {
+                          method: 'POST',
+                          headers: {'Content-Type': 'application/json'},
+                          body: JSON.stringify({ titleBase64, videoDataUrl, channelName: currentUser.channelName })
+                      });
+
+                      const data = await res.json();
+                      if (res.ok) {
+                          closeModal('uploadModal');
+                          document.getElementById('vidTitle').value = '';
+                          fileInput.value = '';
+                          ws.send(JSON.stringify({ type: 'new_video' }));
+                          loadVideos();
+                      } else {
+                          alert(data.error || 'Erro ao publicar vídeo.');
+                      }
+                  };
+
+                  reader.readAsDataURL(file);
               }
 
               async function interact(videoId, action) {
@@ -443,12 +453,11 @@ export default {
                       grid.innerHTML = videos.map(v => {
                           const isFollowing = followingChannels.includes(v.channel_name);
                           
-                          // Decodifica o Base64 armazenado no D1/StreamifyDB de volta para texto legível
                           let decodedTitle = 'Vídeo Sem Título';
                           try {
                               decodedTitle = decodeURIComponent(escape(atob(v.title)));
                           } catch (e) {
-                              decodedTitle = v.title; // Fallback caso venha texto normal
+                              decodedTitle = v.title;
                           }
 
                           return \`
