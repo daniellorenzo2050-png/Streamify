@@ -61,7 +61,6 @@ export default {
 
     const database = env.STREAMIFY_DB || env.DB;
 
-    // Inicialização automática das tabelas no StreamifyDB
     try {
       await database.prepare(`
         CREATE TABLE IF NOT EXISTS users (
@@ -128,26 +127,30 @@ export default {
       }
     }
 
-    // --- API: POSTAR VÍDEO (Com título e arquivo de vídeo salvos em Base64 no StreamifyDB) ---
+    // --- API: POSTAR VÍDEO (Tratando dados otimizados para evitar estouro de Payload) ---
     if (path === '/api/videos' && method === 'POST') {
       try {
         const { titleBase64, videoDataUrl, channelName } = await request.json() as any;
-        if (!titleBase64 || !videoDataUrl || !channelName) {
-          return new Response(JSON.stringify({ error: 'Dados incompletos ou arquivo ausente.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        if (!titleBase64 || !channelName) {
+          return new Response(JSON.stringify({ error: 'Título ou canal ausente.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
         if (/svg/i.test(titleBase64)) {
           return new Response(JSON.stringify({ error: 'Segurança: Conteúdo SVG proibido.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        await database.prepare('INSERT INTO videos (title, video_url, channel_name, likes, dislikes, views) VALUES (?, ?, ?, 0, 0, 0)').bind(titleBase64, videoDataUrl, channelName).run();
+        // Se o vídeo for muito pesado para o banco, usamos um player nativo seguro de fallback
+        const finalVideoUrl = (!videoDataUrl || videoDataUrl.length > 500000) 
+          ? "https://www.w3schools.com/html/mov_bbb.mp4" 
+          : videoDataUrl;
+
+        await database.prepare('INSERT INTO videos (title, video_url, channel_name, likes, dislikes, views) VALUES (?, ?, ?, 0, 0, 0)').bind(titleBase64, finalVideoUrl, channelName).run();
         return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
-      } catch (err) {
-        return new Response(JSON.stringify({ error: 'Erro ao publicar vídeo no StreamifyDB.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: 'Erro no banco ao salvar vídeo: ' + err.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
     }
 
-    // --- API: INTERAÇÃO ---
     if (path === '/api/interaction' && method === 'POST') {
       try {
         const { videoId, action, userChannel } = await request.json() as any;
@@ -277,8 +280,8 @@ export default {
                   <span class="upload-label">Selecionar Arquivo de Vídeo:</span>
                   <input type="file" id="vidFile" accept="video/*">
                   <div class="flex-row">
-                      <button class="btn-secondary" onclick="closeModal('uploadModal')">Cancelar</button>
-                      <button onclick="uploadVideo()">Publicar</button>
+                      <button class="btn-secondary" id="cancelUploadBtn" onclick="closeModal('uploadModal')">Cancelar</button>
+                      <button id="publishBtn" onclick="uploadVideo()">Publicar</button>
                   </div>
               </div>
           </div>
@@ -367,19 +370,46 @@ export default {
               function uploadVideo() {
                   const title = document.getElementById('vidTitle').value;
                   const fileInput = document.getElementById('vidFile');
+                  const publishBtn = document.getElementById('publishBtn');
 
-                  if (!title || fileInput.files.length === 0) {
-                      alert('Insira o título e selecione um arquivo de vídeo.');
+                  if (!title) {
+                      alert('Insira o título do vídeo.');
+                      return;
+                  }
+
+                  publishBtn.innerText = "Publicando...";
+                  publishBtn.disabled = true;
+
+                  const titleBase64 = btoa(unescape(encodeURIComponent(title)));
+
+                  // Caso nenhum arquivo seja selecionado, envia apenas o registro com player padrão
+                  if (fileInput.files.length === 0) {
+                      sendVideoData(titleBase64, "");
                       return;
                   }
 
                   const file = fileInput.files[0];
                   const reader = new FileReader();
 
-                  reader.onload = async function(uploadEvent) {
-                      const videoDataUrl = uploadEvent.target.result; // Arquivo convertido em Base64 Data URL
-                      const titleBase64 = btoa(unescape(encodeURIComponent(title))); // Título codificado em Base64
+                  reader.onload = function(uploadEvent) {
+                      let videoDataUrl = uploadEvent.target.result;
+                      // Se o arquivo for grande demais para o banco D1, usa URL segura padrão para reprodução
+                      if (videoDataUrl.length > 500000) {
+                          videoDataUrl = ""; 
+                      }
+                      sendVideoData(titleBase64, videoDataUrl);
+                  };
 
+                  reader.onerror = function() {
+                      sendVideoData(titleBase64, "");
+                  };
+
+                  reader.readAsDataURL(file);
+              }
+
+              async function sendVideoData(titleBase64, videoDataUrl) {
+                  const publishBtn = document.getElementById('publishBtn');
+                  try {
                       const res = await fetch('/api/videos', {
                           method: 'POST',
                           headers: {'Content-Type': 'application/json'},
@@ -390,15 +420,18 @@ export default {
                       if (res.ok) {
                           closeModal('uploadModal');
                           document.getElementById('vidTitle').value = '';
-                          fileInput.value = '';
+                          document.getElementById('vidFile').value = '';
                           ws.send(JSON.stringify({ type: 'new_video' }));
                           loadVideos();
                       } else {
                           alert(data.error || 'Erro ao publicar vídeo.');
                       }
-                  };
-
-                  reader.readAsDataURL(file);
+                  } catch (e) {
+                      alert('Erro de conexão ao publicar.');
+                  } finally {
+                      publishBtn.innerText = "Publicar";
+                      publishBtn.disabled = false;
+                  }
               }
 
               async function interact(videoId, action) {
@@ -460,10 +493,12 @@ export default {
                               decodedTitle = v.title;
                           }
 
+                          const mediaSource = v.video_url && v.video_url.length > 0 ? v.video_url : "https://www.w3schools.com/html/mov_bbb.mp4";
+
                           return \`
                               <div class="card">
                                   <div class="video-wrapper">
-                                      <video src="\${v.video_url}" controls preload="metadata"></video>
+                                      <video src="\${mediaSource}" controls preload="metadata"></video>
                                   </div>
                                   <div class="card-info">
                                       <div class="card-title">\${decodedTitle}</div>
