@@ -1,8 +1,49 @@
 import { DurableObject } from "cloudflare:workers";
 
+// Durable Object para gerenciar o estado em tempo real (WebSocket, Likes, Views, Seguidores) via WebSockets
 export class StreamifyDO extends DurableObject {
+  sessions: Set<WebSocket>;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
+    this.sessions = new Set();
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    const upgradeHeader = request.headers.get("Upgrade");
+    if (!upgradeHeader || upgradeHeader !== "websocket") {
+      return new Response("Esperando conexão WebSocket", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    this.ctx.acceptWebSocket(server);
+    this.sessions.add(server);
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string) {
+    // Broadcast de ações em tempo real para todos os clientes conectados
+    for (const session of this.sessions) {
+      try {
+        session.send(message);
+      } catch (err) {
+        this.sessions.delete(session);
+      }
+    }
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    this.sessions.delete(ws);
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown) {
+    this.sessions.delete(ws);
   }
 }
 
@@ -18,6 +59,13 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+
+    // --- ENDPOINT WEBSOCKET DO DURABLE OBJECT ---
+    if (path === '/ws') {
+      const id = env.STREAMIFY_DO.idFromName("global-streamify-room");
+      const stub = env.STREAMIFY_DO.get(id);
+      return stub.fetch(request);
+    }
 
     // --- API: REGISTRO ---
     if (path === '/api/register' && method === 'POST') {
@@ -65,12 +113,16 @@ export default {
       }
     }
 
-    // --- API: POSTAR VÍDEO ---
+    // --- API: POSTAR VÍDEO (Com validação estrita anti-SVG) ---
     if (path === '/api/videos' && method === 'POST') {
       try {
         const { title, videoUrl, channelName } = await request.json() as any;
         if (!title || !videoUrl || !channelName) {
           return new Response(JSON.stringify({ error: 'Dados incompletos.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        if (/<svg/i.test(videoUrl) || /svg/i.test(title)) {
+          return new Response(JSON.stringify({ error: 'O uso de SVG ou tags vetoriais em vídeos/iframes é proibido por segurança.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
         await env.DB.prepare(`
@@ -79,14 +131,50 @@ export default {
             title TEXT,
             video_url TEXT,
             channel_name TEXT,
+            likes INTEGER DEFAULT 0,
+            dislikes INTEGER DEFAULT 0,
+            views INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
           )
         `).run();
 
-        await env.DB.prepare('INSERT INTO videos (title, video_url, channel_name) VALUES (?, ?, ?)').bind(title, videoUrl, channelName).run();
+        await env.DB.prepare('INSERT INTO videos (title, video_url, channel_name, likes, dislikes, views) VALUES (?, ?, ?, 0, 0, 0)').bind(title, videoUrl, channelName).run();
         return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: 'Erro ao postar vídeo.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // --- API: INTERAÇÃO (Like, Dislike, View, Seguir) ---
+    if (path === '/api/interaction' && method === 'POST') {
+      try {
+        const { videoId, action } = await request.json() as any;
+        
+        await env.DB.prepare(`
+          CREATE TABLE IF NOT EXISTS videos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            video_url TEXT,
+            channel_name TEXT,
+            likes INTEGER DEFAULT 0,
+            dislikes INTEGER DEFAULT 0,
+            views INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+          )
+        `).run();
+
+        if (action === 'like') {
+          await env.DB.prepare('UPDATE videos SET likes = likes + 1 WHERE id = ?').bind(videoId).run();
+        } else if (action === 'dislike') {
+          await env.DB.prepare('UPDATE videos SET dislikes = dislikes + 1 WHERE id = ?').bind(videoId).run();
+        } else if (action === 'view') {
+          await env.DB.prepare('UPDATE videos SET views = views + 1 WHERE id = ?').bind(videoId).run();
+        }
+
+        const updatedVideo = await env.DB.prepare('SELECT * FROM videos WHERE id = ?').bind(videoId).first();
+        return new Response(JSON.stringify({ success: true, video: updatedVideo }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: 'Erro ao registrar interação.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
     }
 
@@ -99,6 +187,9 @@ export default {
             title TEXT,
             video_url TEXT,
             channel_name TEXT,
+            likes INTEGER DEFAULT 0,
+            dislikes INTEGER DEFAULT 0,
+            views INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
           )
         `).run();
@@ -110,7 +201,7 @@ export default {
       }
     }
 
-    // --- INTERFACE WEB (HTML5, CSS3, JS & SVG) ---
+    // --- INTERFACE WEB (HTML5, CSS3, JS & WebSocket em tempo real, sem ícone SVG) ---
     const html = `
       <!DOCTYPE html>
       <html lang="pt-BR">
@@ -123,23 +214,27 @@ export default {
               body { background-color: #0f0f0f; color: #fff; }
               header { display: flex; justify-content: space-between; align-items: center; padding: 10px 24px; background-color: #212121; position: sticky; top: 0; z-index: 100; border-bottom: 1px solid #303030; }
               .logo-area { display: flex; align-items: center; gap: 12px; cursor: pointer; }
-              .logo-icon { width: 32px; height: 32px; fill: #ff0000; }
-              .logo-text { font-size: 20px; font-weight: bold; letter-spacing: -1px; }
+              .logo-text { font-size: 22px; font-weight: bold; letter-spacing: -1px; color: #ff0033; }
               .user-section { display: flex; align-items: center; gap: 15px; }
               button { background: #3ea6ff; border: none; color: #0f0f0f; padding: 8px 16px; border-radius: 18px; font-weight: bold; cursor: pointer; transition: 0.2s; }
               button:hover { background: #65b8ff; }
               .btn-secondary { background: transparent; color: #fff; border: 1px solid #303030; }
               .btn-secondary:hover { background: rgba(255,255,255,0.1); }
+              .btn-action { background: #272727; color: #f1f1f1; border-radius: 16px; padding: 6px 12px; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+              .btn-action:hover { background: #3f3f3f; }
               
               .container { max-width: 1400px; margin: 24px auto; padding: 0 16px; }
-              .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
-              .card { background: #1f1f1f; border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; cursor: pointer; transition: transform 0.2s; border: 1px solid #303030; }
-              .card:hover { transform: scale(1.02); }
+              .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
+              .card { background: #1f1f1f; border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; border: 1px solid #303030; }
               .video-wrapper { position: relative; width: 100%; padding-top: 56.25%; background: #000; }
               .video-wrapper iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
-              .card-info { padding: 12px; }
-              .card-title { font-size: 15px; font-weight: 500; margin-bottom: 6px; color: #f1f1f1; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-              .card-channel { font-size: 13px; color: #aaa; }
+              .card-info { padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+              .card-title { font-size: 15px; font-weight: 500; color: #f1f1f1; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+              .card-meta-row { display: flex; justify-content: space-between; align-items: center; }
+              .card-channel { font-size: 14px; color: #aaa; display: flex; align-items: center; gap: 8px; }
+              .btn-follow { background: #fff; color: #0f0f0f; padding: 4px 10px; font-size: 12px; border-radius: 12px; }
+              .btn-follow.following { background: #333; color: #aaa; }
+              .actions-row { display: flex; gap: 8px; margin-top: 4px; }
 
               /* Modais */
               .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); justify-content: center; align-items: center; z-index: 1000; }
@@ -155,9 +250,6 @@ export default {
 
           <header>
               <div class="logo-area" onclick="location.reload()">
-                  <svg class="logo-icon" viewBox="0 0 24 24">
-                      <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
-                  </svg>
                   <span class="logo-text">Streamify</span>
               </div>
               <div class="user-section" id="userSection">
@@ -171,12 +263,10 @@ export default {
                   <h3 id="welcomeChannel" style="color: #aaa; font-weight: normal;"></h3>
                   <button onclick="openModal('uploadModal')">+ Postar Vídeo</button>
               </div>
-              <div class="grid" id="videoGrid">
-                  <!-- Os vídeos injetados via JS aparecerão aqui -->
-              </div>
+              <div class="grid" id="videoGrid"></div>
           </div>
 
-          <!-- Modal de Registro -->
+          <!-- Modais de Autenticação e Upload -->
           <div id="registerModal" class="modal">
               <div class="modal-content">
                   <h2>Criar Conta</h2>
@@ -190,7 +280,6 @@ export default {
               </div>
           </div>
 
-          <!-- Modal de Login -->
           <div id="loginModal" class="modal">
               <div class="modal-content">
                   <h2>Entrar</h2>
@@ -203,7 +292,6 @@ export default {
               </div>
           </div>
 
-          <!-- Modal de Upload de Vídeo -->
           <div id="uploadModal" class="modal">
               <div class="modal-content">
                   <h2>Postar Vídeo</h2>
@@ -218,6 +306,20 @@ export default {
 
           <script>
               let currentUser = JSON.parse(localStorage.getItem('streamify_user')) || null;
+              let followingChannels = JSON.parse(localStorage.getItem('streamify_following')) || [];
+              
+              // Conexão WebSocket em Tempo Real
+              const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+              const ws = new WebSocket(\`\${protocol}//\${window.location.host}/ws\`);
+
+              ws.onmessage = (event) => {
+                  try {
+                      const data = JSON.parse(event.data);
+                      if (data.type === 'update_video' || data.type === 'new_video') {
+                          loadVideos();
+                      }
+                  } catch (e) {}
+              };
 
               function updateUI() {
                   const userSec = document.getElementById('userSection');
@@ -293,6 +395,11 @@ export default {
                       return;
                   }
 
+                  if (videoUrl.toLowerCase().includes('svg') || title.toLowerCase().includes('svg')) {
+                      alert('Erro: O uso de SVG em iframes ou títulos é banido na plataforma.');
+                      return;
+                  }
+
                   const res = await fetch('/api/videos', {
                       method: 'POST',
                       headers: {'Content-Type': 'application/json'},
@@ -303,10 +410,33 @@ export default {
                       closeModal('uploadModal');
                       document.getElementById('vidTitle').value = '';
                       document.getElementById('vidUrl').value = '';
+                      ws.send(JSON.stringify({ type: 'new_video' }));
                       loadVideos();
                   } else {
                       alert('Erro ao publicar vídeo.');
                   }
+              }
+
+              async function interact(videoId, action) {
+                  const res = await fetch('/api/interaction', {
+                      method: 'POST',
+                      headers: {'Content-Type': 'application/json'},
+                      body: JSON.stringify({ videoId, action })
+                  });
+                  if (res.ok) {
+                      ws.send(JSON.stringify({ type: 'update_video', videoId }));
+                      loadVideos();
+                  }
+              }
+
+              function toggleFollow(channelName) {
+                  if (followingChannels.includes(channelName)) {
+                      followingChannels = followingChannels.filter(c => c !== channelName);
+                  } else {
+                      followingChannels.push(channelName);
+                  }
+                  localStorage.setItem('streamify_following', JSON.stringify(followingChannels));
+                  loadVideos();
               }
 
               async function loadVideos() {
@@ -320,17 +450,33 @@ export default {
                           return;
                       }
 
-                      grid.innerHTML = videos.map(v => \`
-                          <div class="card">
-                              <div class="video-wrapper">
-                                  <iframe src="\${v.video_url}" allowfullscreen></iframe>
+                      grid.innerHTML = videos.map(v => {
+                          const isFollowing = followingChannels.includes(v.channel_name);
+                          return \`
+                              <div class="card">
+                                  <div class="video-wrapper">
+                                      <iframe src="\${v.video_url}" sandbox="allow-scripts allow-same-origin allow-presentation" allowfullscreen onplay="interact(\${v.id}, 'view')"></iframe>
+                                  </div>
+                                  <div class="card-info">
+                                      <div class="card-title">\${v.title}</div>
+                                      <div class="card-meta-row">
+                                          <div class="card-channel">
+                                              <span>\${v.channel_name}</span>
+                                              <button class="btn-follow \${isFollowing ? 'following' : ''}" onclick="toggleFollow('\${v.channel_name}')">
+                                                  \${isFollowing ? 'Seguindo' : 'Seguir'}
+                                              </button>
+                                          </div>
+                                          <span style="font-size: 12px; color: #aaa;">👁️ \${v.views || 0} visualizações</span>
+                                      </div>
+                                      <div class="actions-row">
+                                          <button class="btn-action" onclick="interact(\${v.id}, 'like')">👍 \${v.likes || 0}</button>
+                                          <button class="btn-action" onclick="interact(\${v.id}, 'dislike')">👎 \${v.dislikes || 0}</button>
+                                          <button class="btn-action" onclick="interact(\${v.id}, 'view')">🔄 Atualizar</button>
+                                      </div>
+                                  </div>
                               </div>
-                              <div class="card-info">
-                                  <div class="card-title">\${v.title}</div>
-                                  <div class="card-channel">\${v.channel_name}</div>
-                              </div>
-                          </div>
-                      \`).join('');
+                          \`;
+                      }).join('');
                   } catch (e) {
                       grid.innerHTML = '<p style="color: #777;">Erro ao carregar vídeos.</p>';
                   }
