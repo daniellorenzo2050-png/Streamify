@@ -10,10 +10,11 @@ binding = "DB"
 database_name = "streamifydb"
 database_id = "c7e67ec0-a6b8-4744-bcbd-b3b7721cde2b"
 
-# Armazenamento de objetos (Bucket para vídeos brutos e capas)
-[[r2_buckets]]
-binding = "VIDEO_BUCKET"
-bucket_name = "streamify-videos-raw"
+# Durable Objects (substituindo o bucket R2 conforme solicitado)
+[durable_objects]
+bindings = [
+  { name = "STREAMIFY_DO", class_name = "StreamifyDO" }
+]
 
 # Cache e filas de processamento/transcodificação
 [[kv_namespaces]]
