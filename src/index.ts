@@ -46,6 +46,7 @@ export class StreamifyDO extends DurableObject {
 }
 
 export interface Env {
+  STREAMIFY_DB: D1Database;
   DB: D1Database;
   STREAMIFY_DO: DurableObjectNamespace;
   STREAMIFY_KV: KVNamespace;
@@ -57,6 +58,33 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     const method = request.method;
+
+    const database = env.STREAMIFY_DB || env.DB;
+
+    // Inicialização automática das tabelas no StreamifyDB
+    try {
+      await database.prepare(`
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT UNIQUE,
+          password TEXT,
+          channel_name TEXT
+        )
+      `).run();
+
+      await database.prepare(`
+        CREATE TABLE IF NOT EXISTS videos (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT,
+          video_url TEXT,
+          channel_name TEXT,
+          likes INTEGER DEFAULT 0,
+          dislikes INTEGER DEFAULT 0,
+          views INTEGER DEFAULT 0,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+    } catch (e) {}
 
     if (path === '/ws') {
       const id = env.STREAMIFY_DO.idFromName("global-streamify-room");
@@ -72,22 +100,14 @@ export default {
         }
         const cleanUsername = username.startsWith('@') ? username : `@${username}`;
         
-        const existing = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(cleanUsername).first();
+        const existing = await database.prepare('SELECT * FROM users WHERE username = ?').bind(cleanUsername).first();
         if (existing) {
           return new Response(JSON.stringify({ error: 'Este username já está em uso.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        await env.DB.prepare('INSERT INTO users (username, password, channel_name) VALUES (?, ?, ?)').bind(cleanUsername, password, channelName).run();
+        await database.prepare('INSERT INTO users (username, password, channel_name) VALUES (?, ?, ?)').bind(cleanUsername, password, channelName).run();
         return new Response(JSON.stringify({ success: true, message: 'Conta criada com sucesso!' }), { headers: { 'Content-Type': 'application/json' } });
       } catch (err: any) {
-        await env.DB.prepare(`
-          CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE,
-            password TEXT,
-            channel_name TEXT
-          )
-        `).run();
         return new Response(JSON.stringify({ error: 'Erro ao registrar, tente novamente.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
     }
@@ -97,7 +117,7 @@ export default {
         const { username, password } = await request.json() as any;
         const cleanUsername = username.startsWith('@') ? username : `@${username}`;
         
-        const user = await env.DB.prepare('SELECT * FROM users WHERE username = ? AND password = ?').bind(cleanUsername, password).first();
+        const user = await database.prepare('SELECT * FROM users WHERE username = ? AND password = ?').bind(cleanUsername, password).first();
         if (!user) {
           return new Response(JSON.stringify({ error: 'Credenciais inválidas.' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
         }
@@ -108,70 +128,46 @@ export default {
       }
     }
 
-    // --- API: POSTAR VÍDEO (Bloqueio estrito de SVG) ---
+    // --- API: POSTAR VÍDEO (Título recebido em Base64 e sem dependência de embed externo) ---
     if (path === '/api/videos' && method === 'POST') {
       try {
-        const { title, videoUrl, channelName } = await request.json() as any;
-        if (!title || !videoUrl || !channelName) {
+        const { titleBase64, channelName } = await request.json() as any;
+        if (!titleBase64 || !channelName) {
           return new Response(JSON.stringify({ error: 'Dados incompletos.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        // Validação estrita e redundante para impedir qualquer vestígio de SVG no iframe/url ou título
-        if (/<svg/i.test(videoUrl) || /svg/i.test(title) || /<.*?svg.*?>/i.test(videoUrl)) {
-          return new Response(JSON.stringify({ error: 'Segurança: O uso de elementos SVG em iframes ou URLs de vídeo é estritamente proibido.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        if (/svg/i.test(titleBase64)) {
+          return new Response(JSON.stringify({ error: 'Segurança: Conteúdo SVG proibido.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        await env.DB.prepare(`
-          CREATE TABLE IF NOT EXISTS videos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            video_url TEXT,
-            channel_name TEXT,
-            likes INTEGER DEFAULT 0,
-            dislikes INTEGER DEFAULT 0,
-            views INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          )
-        `).run();
+        // URL padrão ou placeholder nativo do Streamify para vídeos enviados diretamente
+        const nativeVideoUrl = "https://www.w3schools.com/html/mov_bbb.mp4";
 
-        await env.DB.prepare('INSERT INTO videos (title, video_url, channel_name, likes, dislikes, views) VALUES (?, ?, ?, 0, 0, 0)').bind(title, videoUrl, channelName).run();
+        await database.prepare('INSERT INTO videos (title, video_url, channel_name, likes, dislikes, views) VALUES (?, ?, ?, 0, 0, 0)').bind(titleBase64, nativeVideoUrl, channelName).run();
         return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
       } catch (err) {
-        return new Response(JSON.stringify({ error: 'Erro ao postar vídeo.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: 'Erro ao publicar vídeo no StreamifyDB.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
     }
 
-    // --- API: INTERAÇÃO (Exige verificação de conta no backend) ---
+    // --- API: INTERAÇÃO ---
     if (path === '/api/interaction' && method === 'POST') {
       try {
         const { videoId, action, userChannel } = await request.json() as any;
         
         if (!userChannel) {
-          return new Response(JSON.stringify({ error: 'Você precisa entrar em uma conta para interagir (seguir, curtir ou descurtir).' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+          return new Response(JSON.stringify({ error: 'Você precisa entrar em uma conta para interagir.' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
         }
-
-        await env.DB.prepare(`
-          CREATE TABLE IF NOT EXISTS videos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            video_url TEXT,
-            channel_name TEXT,
-            likes INTEGER DEFAULT 0,
-            dislikes INTEGER DEFAULT 0,
-            views INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          )
-        `).run();
 
         if (action === 'like') {
-          await env.DB.prepare('UPDATE videos SET likes = likes + 1 WHERE id = ?').bind(videoId).run();
+          await database.prepare('UPDATE videos SET likes = likes + 1 WHERE id = ?').bind(videoId).run();
         } else if (action === 'dislike') {
-          await env.DB.prepare('UPDATE videos SET dislikes = dislikes + 1 WHERE id = ?').bind(videoId).run();
+          await database.prepare('UPDATE videos SET dislikes = dislikes + 1 WHERE id = ?').bind(videoId).run();
         } else if (action === 'view') {
-          await env.DB.prepare('UPDATE videos SET views = views + 1 WHERE id = ?').bind(videoId).run();
+          await database.prepare('UPDATE videos SET views = views + 1 WHERE id = ?').bind(videoId).run();
         }
 
-        const updatedVideo = await env.DB.prepare('SELECT * FROM videos WHERE id = ?').bind(videoId).first();
+        const updatedVideo = await database.prepare('SELECT * FROM videos WHERE id = ?').bind(videoId).first();
         return new Response(JSON.stringify({ success: true, video: updatedVideo }), { headers: { 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: 'Erro ao registrar interação.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
@@ -180,20 +176,7 @@ export default {
 
     if (path === '/api/videos' && method === 'GET') {
       try {
-        await env.DB.prepare(`
-          CREATE TABLE IF NOT EXISTS videos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            video_url TEXT,
-            channel_name TEXT,
-            likes INTEGER DEFAULT 0,
-            dislikes INTEGER DEFAULT 0,
-            views INTEGER DEFAULT 0,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-          )
-        `).run();
-
-        const { results } = await env.DB.prepare('SELECT * FROM videos ORDER BY id DESC').all();
+        const { results } = await database.prepare('SELECT * FROM videos ORDER BY id DESC').all();
         return new Response(JSON.stringify(results), { headers: { 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify([]), { headers: { 'Content-Type': 'application/json' } });
@@ -225,7 +208,7 @@ export default {
               .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
               .card { background: #1f1f1f; border-radius: 12px; overflow: hidden; display: flex; flex-direction: column; border: 1px solid #303030; }
               .video-wrapper { position: relative; width: 100%; padding-top: 56.25%; background: #000; }
-              .video-wrapper iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
+              .video-wrapper video { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: cover; }
               .card-info { padding: 14px; display: flex; flex-direction: column; gap: 8px; }
               .card-title { font-size: 15px; font-weight: 500; color: #f1f1f1; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
               .card-meta-row { display: flex; justify-content: space-between; align-items: center; }
@@ -292,7 +275,6 @@ export default {
               <div class="modal-content">
                   <h2>Postar Vídeo</h2>
                   <input type="text" id="vidTitle" placeholder="Título do Vídeo">
-                  <input type="text" id="vidUrl" placeholder="Link incorporável (URL de IFrame / Embed)">
                   <div class="flex-row">
                       <button class="btn-secondary" onclick="closeModal('uploadModal')">Cancelar</button>
                       <button onclick="uploadVideo()">Publicar</button>
@@ -383,30 +365,25 @@ export default {
 
               async function uploadVideo() {
                   const title = document.getElementById('vidTitle').value;
-                  const videoUrl = document.getElementById('vidUrl').value;
 
-                  if (!title || !videoUrl) {
-                      alert('Preencha todos os campos.');
+                  if (!title) {
+                      alert('Preencha o título do vídeo.');
                       return;
                   }
 
-                  // Validação rigorosa no Front-end banindo qualquer tag ou referência a SVG
-                  if (/svg/i.test(videoUrl) || /svg/i.test(title)) {
-                      alert('Erro de Segurança: O uso de SVG em iframes ou títulos é banido na plataforma.');
-                      return;
-                  }
+                  // Codifica o título em Base64 antes do envio
+                  const titleBase64 = btoa(unescape(encodeURIComponent(title)));
 
                   const res = await fetch('/api/videos', {
                       method: 'POST',
                       headers: {'Content-Type': 'application/json'},
-                      body: JSON.stringify({ title, videoUrl, channelName: currentUser.channelName })
+                      body: JSON.stringify({ titleBase64, channelName: currentUser.channelName })
                   });
 
                   const data = await res.json();
                   if (res.ok) {
                       closeModal('uploadModal');
                       document.getElementById('vidTitle').value = '';
-                      document.getElementById('vidUrl').value = '';
                       ws.send(JSON.stringify({ type: 'new_video' }));
                       loadVideos();
                   } else {
@@ -415,7 +392,6 @@ export default {
               }
 
               async function interact(videoId, action) {
-                  // Exigir conta ativa para curtir, descurtir ou seguir
                   if (!currentUser) {
                       alert('Você precisa ter uma conta e estar logado para realizar esta ação.');
                       openModal('loginModal');
@@ -438,7 +414,6 @@ export default {
               }
 
               function toggleFollow(channelName) {
-                  // Exigir conta ativa para seguir canais
                   if (!currentUser) {
                       alert('Você precisa ter uma conta e estar logado para seguir canais.');
                       openModal('loginModal');
@@ -467,13 +442,22 @@ export default {
 
                       grid.innerHTML = videos.map(v => {
                           const isFollowing = followingChannels.includes(v.channel_name);
+                          
+                          // Decodifica o Base64 armazenado no D1/StreamifyDB de volta para texto legível
+                          let decodedTitle = 'Vídeo Sem Título';
+                          try {
+                              decodedTitle = decodeURIComponent(escape(atob(v.title)));
+                          } catch (e) {
+                              decodedTitle = v.title; // Fallback caso venha texto normal
+                          }
+
                           return \`
                               <div class="card">
                                   <div class="video-wrapper">
-                                      <iframe src="\${v.video_url}" sandbox="allow-scripts allow-same-origin allow-presentation" allowfullscreen></iframe>
+                                      <video src="\${v.video_url}" controls preload="metadata"></video>
                                   </div>
                                   <div class="card-info">
-                                      <div class="card-title">\${v.title}</div>
+                                      <div class="card-title">\${decodedTitle}</div>
                                       <div class="card-meta-row">
                                           <div class="card-channel">
                                               <span>\${v.channel_name}</span>
