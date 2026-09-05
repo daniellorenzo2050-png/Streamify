@@ -8,7 +8,7 @@ compatibility_date = "2026-03-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "streamifydb"
-database_id = "c7e67ec0-a6b8-4744-bcbd-b3b7721cde2b"
+database_id = "5ca61c76-0fa3-4abb-9bbf-fed942c51faa"
 
 # Durable Objects
 [durable_objects]
