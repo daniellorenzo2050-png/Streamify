@@ -1,0 +1,25 @@
+name = "streamify"
+main = "src/index.ts"
+compatibility_date = "2026-03-01"
+
+# Configuração de Recursos (Bindings) essenciais para a plataforma de vídeo
+
+# Banco de dados relacional para metadados de usuários, vídeos e canais
+[[d1_databases]]
+binding = "DB"
+database_name = "streamifydb"
+database_id = "c7e67ec0-a6b8-4744-bcbd-b3b7721cde2b"
+
+# Armazenamento de objetos (Bucket para vídeos brutos e capas)
+[[r2_buckets]]
+binding = "VIDEO_BUCKET"
+bucket_name = "streamify-videos-raw"
+
+# Cache e filas de processamento/transcodificação
+[[kv_namespaces]]
+binding = "STREAMIFY_KV"
+id = "53dbca5f48c34641a60c288fa20342e5"
+
+[vars]
+ENVIRONMENT = "production"
+MAX_UPLOAD_SIZE_MB = 5000
