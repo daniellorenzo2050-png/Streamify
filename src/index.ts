@@ -1,6 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
 
-// Durable Object para gerenciar o estado em tempo real (WebSocket, Likes, Views, Seguidores) via WebSockets
 export class StreamifyDO extends DurableObject {
   sessions: Set<WebSocket>;
 
@@ -28,7 +27,6 @@ export class StreamifyDO extends DurableObject {
   }
 
   async webSocketMessage(ws: WebSocket, message: string) {
-    // Broadcast de ações em tempo real para todos os clientes conectados
     for (const session of this.sessions) {
       try {
         session.send(message);
@@ -60,14 +58,12 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
-    // --- ENDPOINT WEBSOCKET DO DURABLE OBJECT ---
     if (path === '/ws') {
       const id = env.STREAMIFY_DO.idFromName("global-streamify-room");
       const stub = env.STREAMIFY_DO.get(id);
       return stub.fetch(request);
     }
 
-    // --- API: REGISTRO ---
     if (path === '/api/register' && method === 'POST') {
       try {
         const { username, password, channelName } = await request.json() as any;
@@ -96,7 +92,6 @@ export default {
       }
     }
 
-    // --- API: LOGIN ---
     if (path === '/api/login' && method === 'POST') {
       try {
         const { username, password } = await request.json() as any;
@@ -113,7 +108,7 @@ export default {
       }
     }
 
-    // --- API: POSTAR VÍDEO (Com validação estrita anti-SVG) ---
+    // --- API: POSTAR VÍDEO (Bloqueio estrito de SVG) ---
     if (path === '/api/videos' && method === 'POST') {
       try {
         const { title, videoUrl, channelName } = await request.json() as any;
@@ -121,8 +116,9 @@ export default {
           return new Response(JSON.stringify({ error: 'Dados incompletos.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        if (/<svg/i.test(videoUrl) || /svg/i.test(title)) {
-          return new Response(JSON.stringify({ error: 'O uso de SVG ou tags vetoriais em vídeos/iframes é proibido por segurança.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        // Validação estrita e redundante para impedir qualquer vestígio de SVG no iframe/url ou título
+        if (/<svg/i.test(videoUrl) || /svg/i.test(title) || /<.*?svg.*?>/i.test(videoUrl)) {
+          return new Response(JSON.stringify({ error: 'Segurança: O uso de elementos SVG em iframes ou URLs de vídeo é estritamente proibido.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
         await env.DB.prepare(`
@@ -145,11 +141,15 @@ export default {
       }
     }
 
-    // --- API: INTERAÇÃO (Like, Dislike, View, Seguir) ---
+    // --- API: INTERAÇÃO (Exige verificação de conta no backend) ---
     if (path === '/api/interaction' && method === 'POST') {
       try {
-        const { videoId, action } = await request.json() as any;
+        const { videoId, action, userChannel } = await request.json() as any;
         
+        if (!userChannel) {
+          return new Response(JSON.stringify({ error: 'Você precisa entrar em uma conta para interagir (seguir, curtir ou descurtir).' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+        }
+
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS videos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -178,7 +178,6 @@ export default {
       }
     }
 
-    // --- API: LISTAR VÍDEOS ---
     if (path === '/api/videos' && method === 'GET') {
       try {
         await env.DB.prepare(`
@@ -201,7 +200,6 @@ export default {
       }
     }
 
-    // --- INTERFACE WEB (HTML5, CSS3, JS & WebSocket em tempo real, sem ícone SVG) ---
     const html = `
       <!DOCTYPE html>
       <html lang="pt-BR">
@@ -232,11 +230,10 @@ export default {
               .card-title { font-size: 15px; font-weight: 500; color: #f1f1f1; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
               .card-meta-row { display: flex; justify-content: space-between; align-items: center; }
               .card-channel { font-size: 14px; color: #aaa; display: flex; align-items: center; gap: 8px; }
-              .btn-follow { background: #fff; color: #0f0f0f; padding: 4px 10px; font-size: 12px; border-radius: 12px; }
+              .btn-follow { background: #fff; color: #0f0f0f; padding: 4px 10px; font-size: 12px; border-radius: 12px; cursor: pointer; }
               .btn-follow.following { background: #333; color: #aaa; }
               .actions-row { display: flex; gap: 8px; margin-top: 4px; }
 
-              /* Modais */
               .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); justify-content: center; align-items: center; z-index: 1000; }
               .modal-content { background: #212121; padding: 30px; border-radius: 12px; width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 15px; border: 1px solid #303030; }
               .modal-content h2 { margin-bottom: 5px; font-size: 22px; }
@@ -266,7 +263,6 @@ export default {
               <div class="grid" id="videoGrid"></div>
           </div>
 
-          <!-- Modais de Autenticação e Upload -->
           <div id="registerModal" class="modal">
               <div class="modal-content">
                   <h2>Criar Conta</h2>
@@ -308,7 +304,6 @@ export default {
               let currentUser = JSON.parse(localStorage.getItem('streamify_user')) || null;
               let followingChannels = JSON.parse(localStorage.getItem('streamify_following')) || [];
               
-              // Conexão WebSocket em Tempo Real
               const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
               const ws = new WebSocket(\`\${protocol}//\${window.location.host}/ws\`);
 
@@ -395,8 +390,9 @@ export default {
                       return;
                   }
 
-                  if (videoUrl.toLowerCase().includes('svg') || title.toLowerCase().includes('svg')) {
-                      alert('Erro: O uso de SVG em iframes ou títulos é banido na plataforma.');
+                  // Validação rigorosa no Front-end banindo qualquer tag ou referência a SVG
+                  if (/svg/i.test(videoUrl) || /svg/i.test(title)) {
+                      alert('Erro de Segurança: O uso de SVG em iframes ou títulos é banido na plataforma.');
                       return;
                   }
 
@@ -406,6 +402,7 @@ export default {
                       body: JSON.stringify({ title, videoUrl, channelName: currentUser.channelName })
                   });
 
+                  const data = await res.json();
                   if (res.ok) {
                       closeModal('uploadModal');
                       document.getElementById('vidTitle').value = '';
@@ -413,23 +410,41 @@ export default {
                       ws.send(JSON.stringify({ type: 'new_video' }));
                       loadVideos();
                   } else {
-                      alert('Erro ao publicar vídeo.');
+                      alert(data.error || 'Erro ao publicar vídeo.');
                   }
               }
 
               async function interact(videoId, action) {
+                  // Exigir conta ativa para curtir, descurtir ou seguir
+                  if (!currentUser) {
+                      alert('Você precisa ter uma conta e estar logado para realizar esta ação.');
+                      openModal('loginModal');
+                      return;
+                  }
+
                   const res = await fetch('/api/interaction', {
                       method: 'POST',
                       headers: {'Content-Type': 'application/json'},
-                      body: JSON.stringify({ videoId, action })
+                      body: JSON.stringify({ videoId, action, userChannel: currentUser.channelName })
                   });
+                  
+                  const data = await res.json();
                   if (res.ok) {
                       ws.send(JSON.stringify({ type: 'update_video', videoId }));
                       loadVideos();
+                  } else {
+                      alert(data.error || 'Erro ao interagir.');
                   }
               }
 
               function toggleFollow(channelName) {
+                  // Exigir conta ativa para seguir canais
+                  if (!currentUser) {
+                      alert('Você precisa ter uma conta e estar logado para seguir canais.');
+                      openModal('loginModal');
+                      return;
+                  }
+
                   if (followingChannels.includes(channelName)) {
                       followingChannels = followingChannels.filter(c => c !== channelName);
                   } else {
@@ -455,7 +470,7 @@ export default {
                           return \`
                               <div class="card">
                                   <div class="video-wrapper">
-                                      <iframe src="\${v.video_url}" sandbox="allow-scripts allow-same-origin allow-presentation" allowfullscreen onplay="interact(\${v.id}, 'view')"></iframe>
+                                      <iframe src="\${v.video_url}" sandbox="allow-scripts allow-same-origin allow-presentation" allowfullscreen></iframe>
                                   </div>
                                   <div class="card-info">
                                       <div class="card-title">\${v.title}</div>
@@ -471,7 +486,7 @@ export default {
                                       <div class="actions-row">
                                           <button class="btn-action" onclick="interact(\${v.id}, 'like')">👍 \${v.likes || 0}</button>
                                           <button class="btn-action" onclick="interact(\${v.id}, 'dislike')">👎 \${v.dislikes || 0}</button>
-                                          <button class="btn-action" onclick="interact(\${v.id}, 'view')">🔄 Atualizar</button>
+                                          <button class="btn-action" onclick="interact(\${v.id}, 'view')">🔄 Contabilizar View</button>
                                       </div>
                                   </div>
                               </div>
