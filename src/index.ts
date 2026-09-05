@@ -127,27 +127,46 @@ export default {
       }
     }
 
-    // --- API: POSTAR VÍDEO (Tratando dados otimizados para evitar estouro de Payload) ---
+    // --- API: POSTAR VÍDEO (Salva o vídeo real do usuário em Base64 / Data URL) ---
     if (path === '/api/videos' && method === 'POST') {
       try {
         const { titleBase64, videoDataUrl, channelName } = await request.json() as any;
-        if (!titleBase64 || !channelName) {
-          return new Response(JSON.stringify({ error: 'Título ou canal ausente.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        if (!titleBase64 || !videoDataUrl || !channelName) {
+          return new Response(JSON.stringify({ error: 'Título, arquivo de vídeo ou canal ausente.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
         if (/svg/i.test(titleBase64)) {
           return new Response(JSON.stringify({ error: 'Segurança: Conteúdo SVG proibido.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        // Se o vídeo for muito pesado para o banco, usamos um player nativo seguro de fallback
-        const finalVideoUrl = (!videoDataUrl || videoDataUrl.length > 500000) 
-          ? "https://www.w3schools.com/html/mov_bbb.mp4" 
-          : videoDataUrl;
-
-        await database.prepare('INSERT INTO videos (title, video_url, channel_name, likes, dislikes, views) VALUES (?, ?, ?, 0, 0, 0)').bind(titleBase64, finalVideoUrl, channelName).run();
+        await database.prepare('INSERT INTO videos (title, video_url, channel_name, likes, dislikes, views) VALUES (?, ?, ?, 0, 0, 0)').bind(titleBase64, videoDataUrl, channelName).run();
         return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
       } catch (err: any) {
-        return new Response(JSON.stringify({ error: 'Erro no banco ao salvar vídeo: ' + err.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        return new Response(JSON.stringify({ error: 'Erro ao salvar vídeo (arquivo muito grande para o D1). Tente um vídeo menor.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+      }
+    }
+
+    // --- API: DELETAR VÍDEO (Exclusivo para o dono) ---
+    if (path === '/api/delete-video' && method === 'POST') {
+      try {
+        const { videoId, userChannel } = await request.json() as any;
+        if (!videoId || !userChannel) {
+          return new Response(JSON.stringify({ error: 'Dados insuficientes.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        const video = await database.prepare('SELECT * FROM videos WHERE id = ?').bind(videoId).first();
+        if (!video) {
+          return new Response(JSON.stringify({ error: 'Vídeo não encontrado.' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        if (video.channel_name !== userChannel) {
+          return new Response(JSON.stringify({ error: 'Apenas o dono do canal pode deletar este vídeo.' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        await database.prepare('DELETE FROM videos WHERE id = ?').bind(videoId).run();
+        return new Response(JSON.stringify({ success: true }), { headers: { 'Content-Type': 'application/json' } });
+      } catch (err) {
+        return new Response(JSON.stringify({ error: 'Erro ao deletar vídeo.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
       }
     }
 
@@ -203,6 +222,8 @@ export default {
               .btn-secondary:hover { background: rgba(255,255,255,0.1); }
               .btn-action { background: #272727; color: #f1f1f1; border-radius: 16px; padding: 6px 12px; font-size: 13px; display: flex; align-items: center; gap: 6px; }
               .btn-action:hover { background: #3f3f3f; }
+              .btn-delete { background: #ff4e4e; color: #fff; border-radius: 16px; padding: 6px 12px; font-size: 13px; font-weight: bold; }
+              .btn-delete:hover { background: #ff2222; }
               
               .container { max-width: 1400px; margin: 24px auto; padding: 0 16px; }
               .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
@@ -215,7 +236,7 @@ export default {
               .card-channel { font-size: 14px; color: #aaa; display: flex; align-items: center; gap: 8px; }
               .btn-follow { background: #fff; color: #0f0f0f; padding: 4px 10px; font-size: 12px; border-radius: 12px; cursor: pointer; }
               .btn-follow.following { background: #333; color: #aaa; }
-              .actions-row { display: flex; gap: 8px; margin-top: 4px; }
+              .actions-row { display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
 
               .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); justify-content: center; align-items: center; z-index: 1000; }
               .modal-content { background: #212121; padding: 30px; border-radius: 12px; width: 100%; max-width: 400px; display: flex; flex-direction: column; gap: 15px; border: 1px solid #303030; }
@@ -372,65 +393,65 @@ export default {
                   const fileInput = document.getElementById('vidFile');
                   const publishBtn = document.getElementById('publishBtn');
 
-                  if (!title) {
-                      alert('Insira o título do vídeo.');
+                  if (!title || fileInput.files.length === 0) {
+                      alert('Insira o título e selecione um arquivo de vídeo.');
                       return;
                   }
 
                   publishBtn.innerText = "Publicando...";
                   publishBtn.disabled = true;
 
-                  const titleBase64 = btoa(unescape(encodeURIComponent(title)));
-
-                  // Caso nenhum arquivo seja selecionado, envia apenas o registro com player padrão
-                  if (fileInput.files.length === 0) {
-                      sendVideoData(titleBase64, "");
-                      return;
-                  }
-
                   const file = fileInput.files[0];
                   const reader = new FileReader();
 
-                  reader.onload = function(uploadEvent) {
-                      let videoDataUrl = uploadEvent.target.result;
-                      // Se o arquivo for grande demais para o banco D1, usa URL segura padrão para reprodução
-                      if (videoDataUrl.length > 500000) {
-                          videoDataUrl = ""; 
-                      }
-                      sendVideoData(titleBase64, videoDataUrl);
-                  };
+                  reader.onload = async function(uploadEvent) {
+                      const videoDataUrl = uploadEvent.target.result;
+                      const titleBase64 = btoa(unescape(encodeURIComponent(title)));
 
-                  reader.onerror = function() {
-                      sendVideoData(titleBase64, "");
+                      try {
+                          const res = await fetch('/api/videos', {
+                              method: 'POST',
+                              headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify({ titleBase64, videoDataUrl, channelName: currentUser.channelName })
+                          });
+
+                          const data = await res.json();
+                          if (res.ok) {
+                              closeModal('uploadModal');
+                              document.getElementById('vidTitle').value = '';
+                              fileInput.value = '';
+                              ws.send(JSON.stringify({ type: 'new_video' }));
+                              loadVideos();
+                          } else {
+                              alert(data.error || 'Erro ao publicar vídeo.');
+                          }
+                      } catch (e) {
+                          alert('Erro de conexão ao publicar.');
+                      } finally {
+                          publishBtn.innerText = "Publicar";
+                          publishBtn.disabled = false;
+                      }
                   };
 
                   reader.readAsDataURL(file);
               }
 
-              async function sendVideoData(titleBase64, videoDataUrl) {
-                  const publishBtn = document.getElementById('publishBtn');
-                  try {
-                      const res = await fetch('/api/videos', {
-                          method: 'POST',
-                          headers: {'Content-Type': 'application/json'},
-                          body: JSON.stringify({ titleBase64, videoDataUrl, channelName: currentUser.channelName })
-                      });
+              async function deleteVideo(videoId) {
+                  if (!currentUser) return;
+                  if (!confirm('Deseja realmente apagar este vídeo?')) return;
 
-                      const data = await res.json();
-                      if (res.ok) {
-                          closeModal('uploadModal');
-                          document.getElementById('vidTitle').value = '';
-                          document.getElementById('vidFile').value = '';
-                          ws.send(JSON.stringify({ type: 'new_video' }));
-                          loadVideos();
-                      } else {
-                          alert(data.error || 'Erro ao publicar vídeo.');
-                      }
-                  } catch (e) {
-                      alert('Erro de conexão ao publicar.');
-                  } finally {
-                      publishBtn.innerText = "Publicar";
-                      publishBtn.disabled = false;
+                  const res = await fetch('/api/delete-video', {
+                      method: 'POST',
+                      headers: {'Content-Type': 'application/json'},
+                      body: JSON.stringify({ videoId, userChannel: currentUser.channelName })
+                  });
+
+                  const data = await res.json();
+                  if (res.ok) {
+                      ws.send(JSON.stringify({ type: 'new_video' }));
+                      loadVideos();
+                  } else {
+                      alert(data.error || 'Erro ao deletar vídeo.');
                   }
               }
 
@@ -485,6 +506,7 @@ export default {
 
                       grid.innerHTML = videos.map(v => {
                           const isFollowing = followingChannels.includes(v.channel_name);
+                          const isOwner = currentUser && currentUser.channelName === v.channel_name;
                           
                           let decodedTitle = 'Vídeo Sem Título';
                           try {
@@ -493,12 +515,10 @@ export default {
                               decodedTitle = v.title;
                           }
 
-                          const mediaSource = v.video_url && v.video_url.length > 0 ? v.video_url : "https://www.w3schools.com/html/mov_bbb.mp4";
-
                           return \`
                               <div class="card">
                                   <div class="video-wrapper">
-                                      <video src="\${mediaSource}" controls preload="metadata"></video>
+                                      <video src="\${v.video_url}" controls preload="metadata"></video>
                                   </div>
                                   <div class="card-info">
                                       <div class="card-title">\${decodedTitle}</div>
@@ -514,7 +534,8 @@ export default {
                                       <div class="actions-row">
                                           <button class="btn-action" onclick="interact(\${v.id}, 'like')">👍 \${v.likes || 0}</button>
                                           <button class="btn-action" onclick="interact(\${v.id}, 'dislike')">👎 \${v.dislikes || 0}</button>
-                                          <button class="btn-action" onclick="interact(\${v.id}, 'view')">🔄 Contabilizar View</button>
+                                          <button class="btn-action" onclick="interact(\${v.id}, 'view')">🔄 View</button>
+                                          \${isOwner ? \`<button class="btn-delete" onclick="deleteVideo(\${v.id})">🗑️ Deletar</button>\` : ''}
                                       </div>
                                   </div>
                               </div>
