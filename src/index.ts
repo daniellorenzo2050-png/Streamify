@@ -1,6 +1,14 @@
+import { DurableObject } from "cloudflare:workers";
+
+export class StreamifyDO extends DurableObject {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+  }
+}
+
 export interface Env {
   DB: D1Database;
-  VIDEO_BUCKET: R2Bucket;
+  STREAMIFY_DO: DurableObjectNamespace;
   STREAMIFY_KV: KVNamespace;
   ENVIRONMENT: string;
 }
@@ -20,7 +28,6 @@ export default {
         }
         const cleanUsername = username.startsWith('@') ? username : `@${username}`;
         
-        // Verifica se usuário já existe
         const existing = await env.DB.prepare('SELECT * FROM users WHERE username = ?').bind(cleanUsername).first();
         if (existing) {
           return new Response(JSON.stringify({ error: 'Este username já está em uso.' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
@@ -29,7 +36,6 @@ export default {
         await env.DB.prepare('INSERT INTO users (username, password, channel_name) VALUES (?, ?, ?)').bind(cleanUsername, password, channelName).run();
         return new Response(JSON.stringify({ success: true, message: 'Conta criada com sucesso!' }), { headers: { 'Content-Type': 'application/json' } });
       } catch (err: any) {
-        // Tenta criar a tabela caso não exista
         await env.DB.prepare(`
           CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +59,6 @@ export default {
           return new Response(JSON.stringify({ error: 'Credenciais inválidas.' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
         }
 
-        // Retorna dados básicos do usuário (simulando sessão simples)
         return new Response(JSON.stringify({ success: true, user: { username: user.username, channelName: user.channel_name } }), { headers: { 'Content-Type': 'application/json' } });
       } catch (err) {
         return new Response(JSON.stringify({ error: 'Erro no servidor.' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
@@ -167,9 +172,11 @@ export default {
                   <button onclick="openModal('uploadModal')">+ Postar Vídeo</button>
               </div>
               <div class="grid" id="videoGrid">
-                  </div>
+                  <!-- Os vídeos injetados via JS aparecerão aqui -->
+              </div>
           </div>
 
+          <!-- Modal de Registro -->
           <div id="registerModal" class="modal">
               <div class="modal-content">
                   <h2>Criar Conta</h2>
@@ -183,6 +190,7 @@ export default {
               </div>
           </div>
 
+          <!-- Modal de Login -->
           <div id="loginModal" class="modal">
               <div class="modal-content">
                   <h2>Entrar</h2>
@@ -195,6 +203,7 @@ export default {
               </div>
           </div>
 
+          <!-- Modal de Upload de Vídeo -->
           <div id="uploadModal" class="modal">
               <div class="modal-content">
                   <h2>Postar Vídeo</h2>
