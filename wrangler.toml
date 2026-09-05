@@ -10,11 +10,15 @@ binding = "DB"
 database_name = "streamifydb"
 database_id = "c7e67ec0-a6b8-4744-bcbd-b3b7721cde2b"
 
-# Durable Objects (substituindo o bucket R2 conforme solicitado)
+# Durable Objects
 [durable_objects]
 bindings = [
   { name = "STREAMIFY_DO", class_name = "StreamifyDO" }
 ]
+
+[exports.StreamifyDO]
+type = "durable-object"
+storage = "sqlite"
 
 # Cache e filas de processamento/transcodificação
 [[kv_namespaces]]
